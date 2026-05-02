@@ -81,9 +81,24 @@ CREATE OR REPLACE PACKAGE BODY PKG_NOMINA IS
         bono_clima_sma     NUMBER,
         aporte_vol_bog     NUMBER
     );
+
+    TYPE t_deducciones IS RECORD (
+        salud           NUMBER,
+        pension         NUMBER,
+        fondo_solid     NUMBER,
+        embargo         NUMBER,
+        libranzas       NUMBER,
+        aporte_vol      NUMBER,
+        total           NUMBER
+    );
     
     g_param_cache t_param_cache;
     g_cache_loaded BOOLEAN := FALSE;
+
+    PROCEDURE sp_log_nomina(p_operation VARCHAR2, p_detalle VARCHAR2, 
+                            p_empleados_ok NUMBER DEFAULT 0,
+                            p_empleados_error NUMBER DEFAULT 0,
+                            p_monto_total NUMBER DEFAULT 0);
 
     -- =================================================================
     -- CARGA DE PARÁMETROS DESDE TABLA
@@ -268,18 +283,8 @@ CREATE OR REPLACE PACKAGE BODY PKG_NOMINA IS
     END fn_bruto;
 
     -- =================================================================
-    -- TIPO Y FUNCIÓN PRIVADA PARA DEDUCCIONES
+    -- FUNCIÓN PRIVADA PARA DEDUCCIONES
     -- =================================================================
-    TYPE t_deducciones IS RECORD (
-        salud           NUMBER,
-        pension         NUMBER,
-        fondo_solid     NUMBER,
-        embargo         NUMBER,
-        libranzas       NUMBER,
-        aporte_vol      NUMBER,
-        total           NUMBER
-    );
-    
     FUNCTION fn_deducciones(p_id_empleado NUMBER, p_bruto NUMBER, p_id_quincena VARCHAR2) RETURN t_deducciones IS
         v_result t_deducciones;
         v_bruto_mensual NUMBER;
@@ -327,6 +332,11 @@ CREATE OR REPLACE PACKAGE BODY PKG_NOMINA IS
         v_bruto NUMBER;
         v_ded t_deducciones;
         v_neto NUMBER;
+        v_salario_base_q NUMBER;
+        v_recargos NUMBER;
+        v_bonificacion NUMBER;
+        v_auxilio_transp NUMBER;
+        v_bono_sede NUMBER;
     BEGIN
         SELECT COUNT(*) INTO v_empleado_exist FROM EMPLEADOS WHERE id_empleado = p_id_empleado;
         IF v_empleado_exist = 0 THEN
@@ -356,13 +366,18 @@ CREATE OR REPLACE PACKAGE BODY PKG_NOMINA IS
                 sp_log_nomina('ALERTA_NETO_NEGATIVO', 'Empleado ' || p_id_empleado || ' neto: ' || v_neto, 0, 1, 0);
             END IF;
         END IF;
+        v_salario_base_q := fn_salario_base_q(p_id_empleado, p_id_quincena);
+        v_recargos := fn_recargos(p_id_empleado, p_id_quincena);
+        v_bonificacion := fn_bonificacion(p_id_empleado);
+        v_auxilio_transp := fn_auxilio_transporte(p_id_empleado, p_id_quincena);
+        v_bono_sede := fn_bono_sede(p_id_empleado);
         INSERT INTO LIQUIDACION VALUES (
             SEQ_LIQUIDACION.NEXTVAL, p_id_empleado, p_id_quincena,
-            fn_salario_base_q(p_id_empleado, p_id_quincena),
-            fn_recargos(p_id_empleado, p_id_quincena),
-            fn_bonificacion(p_id_empleado),
-            fn_auxilio_transporte(p_id_empleado, p_id_quincena),
-            fn_bono_sede(p_id_empleado),
+            v_salario_base_q,
+            v_recargos,
+            v_bonificacion,
+            v_auxilio_transp,
+            v_bono_sede,
             v_bruto, v_ded.salud, v_ded.pension, v_ded.fondo_solid,
             v_ded.embargo, v_ded.libranzas, v_ded.aporte_vol, v_ded.total, v_neto, SYSDATE
         );
@@ -477,26 +492,32 @@ CREATE OR REPLACE PACKAGE BODY PKG_NOMINA IS
     -- =================================================================
     -- FUNCIÓN PIPELINED (Punto 7)
     -- =================================================================
-    FUNCTION fn_reporte_nomina(p_cod_sede VARCHAR2 DEFAULT NULL, p_tipo_contrato VARCHAR2 DEFAULT NULL)
-    RETURN t_liqu_table PIPELINED IS
-        v_sql VARCHAR2(4000);
-        v_cursor SYS_REFCURSOR;
-        v_rec t_liqu_row;
-    BEGIN
-        v_sql := 'SELECT l.id_liquidacion, l.id_empleado, e.nombre, e.cod_sede, l.id_quincena, l.bruto, l.neto
-                  FROM LIQUIDACION l JOIN EMPLEADOS e ON l.id_empleado = e.id_empleado WHERE 1=1';
-        IF p_cod_sede IS NOT NULL THEN v_sql := v_sql || ' AND e.cod_sede = :sede'; END IF;
-        IF p_tipo_contrato IS NOT NULL THEN v_sql := v_sql || ' AND e.tipo_contrato = :tipo'; END IF;
-        OPEN v_cursor FOR v_sql USING p_cod_sede, p_tipo_contrato;
-        LOOP
-            FETCH v_cursor INTO v_rec.id_liquidacion, v_rec.id_empleado, v_rec.nombre_empleado, 
-                                v_rec.cod_sede, v_rec.id_quincena, v_rec.bruto, v_rec.neto;
-            EXIT WHEN v_cursor%NOTFOUND;
-            PIPE ROW(v_rec);
-        END LOOP;
-        CLOSE v_cursor;
-        RETURN;
-    END fn_reporte_nomina;
+    FUNCTION fn_reporte_nomina(p_cod_sede VARCHAR2 DEFAULT NULL, 
+                           p_tipo_contrato VARCHAR2 DEFAULT NULL)
+RETURN t_liqu_table PIPELINED IS
+    v_sql VARCHAR2(4000);
+    v_cursor SYS_REFCURSOR;
+    v_rec t_liqu_row;
+BEGIN
+    v_sql := 'SELECT l.id_liquidacion, l.id_empleado, e.nombre, e.cod_sede, l.id_quincena, l.bruto, l.neto
+              FROM LIQUIDACION l 
+              JOIN EMPLEADOS e ON l.id_empleado = e.id_empleado
+              WHERE ( :sede IS NULL OR e.cod_sede = :sede )
+                AND ( :tipo IS NULL OR e.tipo_contrato = :tipo )';
+    
+    OPEN v_cursor FOR v_sql USING p_cod_sede, p_cod_sede, p_tipo_contrato, p_tipo_contrato;
+    -- Nota: cada bind variable debe aparecer tantas veces como se use, y se le pasa el mismo valor.
+    -- En este caso :sede aparece dos veces, por eso pasamos p_cod_sede dos veces.
+    
+    LOOP
+        FETCH v_cursor INTO v_rec.id_liquidacion, v_rec.id_empleado, v_rec.nombre_empleado, 
+                            v_rec.cod_sede, v_rec.id_quincena, v_rec.bruto, v_rec.neto;
+        EXIT WHEN v_cursor%NOTFOUND;
+        PIPE ROW(v_rec);
+    END LOOP;
+    CLOSE v_cursor;
+    RETURN;
+END fn_reporte_nomina;
 
     -- =================================================================
     -- PROCEDIMIENTO DE LOG CON AUTONOMOUS TRANSACTION (Punto 8)
